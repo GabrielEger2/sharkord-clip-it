@@ -1,0 +1,10 @@
+{
+  "id": "clip-it",
+  "name": "Clip It",
+  "author": "Gabriel Eger",
+  "description": "Press a hotkey to clip the last seconds of a voice channel's audio and video, instant-replay style.",
+  "homepage": "https://github.com/GabrielEger2/sharkord-clip-it",
+  "logo": "https://placehold.co/100x100/white/black",
+  "sdkVersion": 2,
+  "version": "0.0.1"
+}

@@ -1,0 +1,25 @@
+{
+  "name": "clip-it",
+  "version": "0.0.1",
+  "module": "src/server/index.ts",
+  "type": "module",
+  "scripts": {
+    "build": "bun build.ts",
+    "publish": "bun publish.ts",
+    "setup": "bun scripts/setup.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "^19.2.14"
+  },
+  "peerDependencies": {
+    "react": "^19",
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "lucide-react": "^0.544.0"
+  },
+  "bun-create": {
+    "start": "bun run setup"
+  }
+}
