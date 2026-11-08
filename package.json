@@ -6,7 +6,8 @@
   "scripts": {
     "build": "bun build.ts",
     "publish": "bun publish.ts",
-    "setup": "bun scripts/setup.ts"
+    "setup": "bun scripts/setup.ts",
+    "smoke": "bun scripts/encode-smoke-test.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

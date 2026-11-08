@@ -28,10 +28,9 @@
 
     // the linked sdk sources under .repos carry their own copy of the react
     // types; pointing every import at this one keeps the type identity single
-    "baseUrl": ".",
     "paths": {
-      "react": ["node_modules/@types/react"],
-      "react/jsx-runtime": ["node_modules/@types/react/jsx-runtime"]
+      "react": ["./node_modules/@types/react"],
+      "react/jsx-runtime": ["./node_modules/@types/react/jsx-runtime"]
     }
   },
   // the linked repos under .repos typecheck with their own configs, not this one

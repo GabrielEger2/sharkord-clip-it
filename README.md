@@ -62,6 +62,17 @@ bun run build
 Enable plugins in the server settings, then enable this one. Restart the
 server to pick up a rebuild.
 
+The encode pipeline can be exercised without a Sharkord server: with an
+ffmpeg on your PATH,
+
+```bash
+bun run smoke
+```
+
+streams real RTP (two opus voices and a VP8 "screen share") to itself,
+captures it the way the recorder does, and runs it through `encodeClip`,
+asserting the resulting file holds both streams.
+
 ## Publishing
 
 Bump `version` in `package.json`, set `GITHUB_TOKEN` in `.env`, then:
@@ -75,8 +86,9 @@ This builds, creates the GitHub release, and opens a PR against the
 
 ## Known limits
 
-- A copied screen share can show a moment of corruption at the very start of
-  a clip until its first buffered keyframe, at most 2 seconds in.
+- ffmpeg drops copied screen share video until the first buffered keyframe,
+  so a clip's video can start up to 2 seconds (the forced keyframe interval)
+  after its audio.
 - Camera (`video`) producers are not clipped, only screen shares.
 - Stream alignment uses packet arrival times, so cross-stream sync is within
   network jitter rather than sample exact.
