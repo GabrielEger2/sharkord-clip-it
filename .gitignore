@@ -36,3 +36,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # cloned Sharkord repos (bun run setup)
 .repos
+
+# encode smoke test output (bun run smoke)
+.smoke-data
