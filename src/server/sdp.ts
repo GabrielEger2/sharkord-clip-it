@@ -1,7 +1,9 @@
 import type { RtpParameters } from "@sharkord/plugin-sdk";
 
-// what ffmpeg needs to interpret a replayed RTP stream: one SDP per stream,
-// each listening on its own loopback port
+// one SDP describing every replayed stream, each on its own loopback port.
+// a single SDP matters: ffmpeg binds all of a file's ports when it opens the
+// input, where separate -i inputs are opened (and bound) one at a time, so
+// replaying to a later input's port hits nothing and raises ICMP errors
 
 const isRtx = (mimeType: string) => /\/rtx$/i.test(mimeType);
 
@@ -15,7 +17,10 @@ const getMediaCodec = (rtpParameters: RtpParameters) => {
   return codec;
 };
 
-const buildStreamSdp = (rtpParameters: RtpParameters, port: number): string => {
+const buildMediaSection = (
+  rtpParameters: RtpParameters,
+  port: number,
+): string[] => {
   const codec = getMediaCodec(rtpParameters);
   const [mediaKind, codecName] = codec.mimeType.split("/");
   const channels =
@@ -26,11 +31,6 @@ const buildStreamSdp = (rtpParameters: RtpParameters, port: number): string => {
   );
 
   const lines = [
-    "v=0",
-    "o=- 0 0 IN IP4 127.0.0.1",
-    "s=sharkord-clip",
-    "c=IN IP4 127.0.0.1",
-    "t=0 0",
     `m=${mediaKind} ${port} RTP/AVP ${codec.payloadType}`,
     `a=rtpmap:${codec.payloadType} ${codecName}/${codec.clockRate}${channels}`,
   ];
@@ -40,6 +40,24 @@ const buildStreamSdp = (rtpParameters: RtpParameters, port: number): string => {
   }
 
   lines.push("a=recvonly");
+
+  return lines;
+};
+
+const buildCombinedSdp = (
+  streams: { rtpParameters: RtpParameters; port: number }[],
+): string => {
+  const lines = [
+    "v=0",
+    "o=- 0 0 IN IP4 127.0.0.1",
+    "s=sharkord-clip",
+    "c=IN IP4 127.0.0.1",
+    "t=0 0",
+  ];
+
+  for (const stream of streams) {
+    lines.push(...buildMediaSection(stream.rtpParameters, stream.port));
+  }
 
   return `${lines.join("\n")}\n`;
 };
@@ -59,4 +77,4 @@ const getVideoCodecName = (rtpParameters: RtpParameters): string => {
   return (name ?? "").toLowerCase();
 };
 
-export { buildStreamSdp, getStreamMediaKind, getVideoCodecName };
+export { buildCombinedSdp, getStreamMediaKind, getVideoCodecName };
