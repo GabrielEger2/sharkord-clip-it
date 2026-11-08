@@ -8,6 +8,9 @@ type TClip = {
   createdAt: number;
   /** plugin http route the clip file is served from */
   url: string;
+  fileName: string;
+  /** whether a screen share made it into the clip */
+  hasVideo: boolean;
 };
 
 /**
