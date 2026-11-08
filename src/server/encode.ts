@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { getFfmpegBinaryPath, getWorkDir } from "./paths";
 import type { TStreamSnapshot } from "./recorder";
-import { buildStreamSdp, getStreamMediaKind, getVideoCodecName } from "./sdp";
+import { buildCombinedSdp, getStreamMediaKind, getVideoCodecName } from "./sdp";
 
 // buffered packets are replayed faster than real time; 8x turns a 30s clip
 // into under 4s of encoding without flooding the loopback sockets
@@ -16,6 +16,8 @@ const FFMPEG_STARTUP_MS = 1000;
 
 // everything is already sent, so a stuck ffmpeg is a bug and not patience
 const FFMPEG_EXIT_TIMEOUT_MS = 30_000;
+
+const MIN_STREAM_PACKETS = 10;
 
 const QUIET = ["-hide_banner", "-nostats", "-loglevel", "level+warning"];
 
@@ -82,56 +84,57 @@ const allocateRtpPort = (used: Set<number>): Promise<number> =>
   });
 
 const buildFfmpegArgs = (options: {
-  sdpPaths: string[];
-  offsets: number[];
-  audioInputs: number[];
-  videoInput: number | null;
+  sdpPath: string;
+  audioCount: number;
+  hasVideo: boolean;
   container: string;
   seconds: number;
   outPath: string;
 }): string[] => {
-  const args = [...QUIET];
+  const args = [
+    ...QUIET,
+    "-protocol_whitelist",
+    "file,udp,rtp",
+    // the probe has to span at least one keyframe interval (2s, forced by the
+    // recorder) or vp8/vp9 dimensions stay unknown and the muxer refuses the
+    // stream. stream time, so at replay speed this is well under a second
+    "-analyzeduration",
+    "5000000",
+    "-probesize",
+    "10485760",
+    "-i",
+    options.sdpPath,
+  ];
 
-  for (let i = 0; i < options.sdpPaths.length; i += 1) {
-    args.push(
-      "-protocol_whitelist",
-      "file,udp,rtp",
-      "-analyzeduration",
-      "1000000",
-      "-probesize",
-      "1048576",
-      "-itsoffset",
-      options.offsets[i]!.toFixed(3),
-      "-i",
-      options.sdpPaths[i]!,
-    );
-  }
-
-  if (options.audioInputs.length === 1) {
+  if (options.audioCount === 1) {
     args.push(
       "-map",
-      `${options.audioInputs[0]}:a:0`,
+      "0:a:0",
       // opus DTX leaves holes where someone was silent; async resampling
       // fills them so the clip does not time-compress
       "-af",
       "aresample=async=1",
     );
-  } else if (options.audioInputs.length > 1) {
-    const resampled = options.audioInputs.map(
-      (input, j) => `[${input}:a:0]aresample=async=1[a${j}]`,
+  } else if (options.audioCount > 1) {
+    const resampled = Array.from(
+      { length: options.audioCount },
+      (_, j) => `[0:a:${j}]aresample=async=1[a${j}]`,
     );
-    const mixInputs = options.audioInputs.map((_, j) => `[a${j}]`).join("");
-    const mix = `${mixInputs}amix=inputs=${options.audioInputs.length}:duration=longest:normalize=0[aout]`;
+    const mixInputs = Array.from(
+      { length: options.audioCount },
+      (_, j) => `[a${j}]`,
+    ).join("");
+    const mix = `${mixInputs}amix=inputs=${options.audioCount}:duration=longest:normalize=0[aout]`;
 
     args.push("-filter_complex", [...resampled, mix].join(";"), "-map", "[aout]");
   }
 
-  if (options.audioInputs.length > 0) {
+  if (options.audioCount > 0) {
     args.push("-c:a", "libopus", "-b:a", "128k", "-ar", "48000", "-ac", "2");
   }
 
-  if (options.videoInput !== null) {
-    args.push("-map", `${options.videoInput}:v:0`, "-c:v", "copy");
+  if (options.hasVideo) {
+    args.push("-map", "0:v:0", "-c:v", "copy");
   }
 
   args.push(
@@ -146,65 +149,98 @@ const buildFfmpegArgs = (options: {
   return args;
 };
 
+/**
+ * a send racing ffmpeg's bind raises ICMP "port unreachable" back on these
+ * sockets as an async error event. this runs inside the server process, so
+ * an unhandled one would take the whole host down, never just the clip
+ */
+const openReplaySockets = (count: number, logger: TLogger) =>
+  Array.from({ length: count }, () => {
+    const socket = dgram.createSocket("udp4");
+
+    socket.on("error", (err) => logger.debug("[replay socket]", err.message));
+
+    return socket;
+  });
+
+const closeSockets = (sockets: dgram.Socket[]) => {
+  for (const socket of sockets) {
+    try {
+      socket.close();
+    } catch {}
+  }
+};
+
 /** replays every stream's packets onto its port, paced by arrival time */
 const replayPackets = async (
   streams: TStreamSnapshot[],
+  sockets: dgram.Socket[],
   ports: number[],
 ): Promise<void> => {
-  const sockets = streams.map(() => dgram.createSocket("udp4"));
-
   const timeline = streams
     .flatMap((stream, i) =>
       stream.packets.map((packet) => ({ at: packet.at, data: packet.data, i })),
     )
     .sort((a, b) => a.at - b.at);
 
-  try {
-    const firstAt = timeline[0]!.at;
-    const startedReal = Date.now();
+  const firstAt = timeline[0]!.at;
+  const startedReal = Date.now();
 
-    for (const packet of timeline) {
-      const target = (packet.at - firstAt) / REPLAY_SPEED;
-      const elapsed = Date.now() - startedReal;
+  for (const packet of timeline) {
+    const target = (packet.at - firstAt) / REPLAY_SPEED;
+    const elapsed = Date.now() - startedReal;
 
-      if (target > elapsed + 2) {
-        await sleep(target - elapsed);
-      }
-
-      sockets[packet.i]!.send(packet.data, ports[packet.i]!, "127.0.0.1");
+    if (target > elapsed + 2) {
+      await sleep(target - elapsed);
     }
 
-    // let the socket queues drain before ffmpeg is told to stop
-    await sleep(500);
-  } finally {
-    for (const socket of sockets) socket.close();
+    sockets[packet.i]!.send(packet.data, ports[packet.i]!, "127.0.0.1");
   }
+
+  // let the socket queues drain before ffmpeg is told to stop
+  await sleep(500);
 };
 
 const encodeClip = async (options: TEncodeOptions): Promise<TEncodeResult> => {
-  const { streams, seconds, outBasePath, logger } = options;
+  const { seconds, outBasePath, logger } = options;
+
+  const streams = options.streams.filter((stream) => {
+    if (stream.packets.length >= MIN_STREAM_PACKETS) return true;
+
+    logger.debug(
+      `Dropping a ${stream.kind} stream of user ${stream.userId} with only ${stream.packets.length} buffered packets`,
+    );
+
+    return false;
+  });
 
   if (streams.length === 0) {
     throw new Error("There is no buffered media to clip yet");
   }
 
-  const audioInputs: number[] = [];
+  let audioCount = 0;
+  let videoStream: TStreamSnapshot | null = null;
 
-  let videoInput: number | null = null;
-
-  for (let i = 0; i < streams.length; i += 1) {
-    if (getStreamMediaKind(streams[i]!.rtpParameters) === "video") {
+  for (const stream of streams) {
+    if (getStreamMediaKind(stream.rtpParameters) === "video") {
       // one video per clip: the first live screen share wins
-      if (videoInput === null) videoInput = i;
+      if (!videoStream) videoStream = stream;
     } else {
-      audioInputs.push(i);
+      audioCount += 1;
     }
   }
 
+  // a second screen share has no slot in the clip, so it is not replayed
+  const replayed = streams.filter(
+    (stream) =>
+      getStreamMediaKind(stream.rtpParameters) === "audio" ||
+      stream === videoStream,
+  );
+
   let container = "webm";
 
-  if (videoInput !== null) {
-    const codecName = getVideoCodecName(streams[videoInput]!.rtpParameters);
+  if (videoStream) {
+    const codecName = getVideoCodecName(videoStream.rtpParameters);
 
     // webm only holds vp8/vp9; an h264 screen share goes into matroska
     if (codecName === "h264") container = "matroska";
@@ -221,31 +257,27 @@ const encodeClip = async (options: TEncodeOptions): Promise<TEncodeResult> => {
   const usedPorts = new Set<number>();
   const ports: number[] = [];
 
-  for (let i = 0; i < streams.length; i += 1) {
+  for (let i = 0; i < replayed.length; i += 1) {
     ports.push(await allocateRtpPort(usedPorts));
   }
 
   const runId = path.basename(outBasePath);
-  const sdpPaths: string[] = [];
+  const sdpPath = path.join(workDir, `${runId}.sdp`);
 
-  for (let i = 0; i < streams.length; i += 1) {
-    const sdpPath = path.join(workDir, `${runId}-${i}.sdp`);
-
-    await fs.writeFile(sdpPath, buildStreamSdp(streams[i]!.rtpParameters, ports[i]!));
-    sdpPaths.push(sdpPath);
-  }
-
-  // streams started buffering at different moments; offsetting each input by
-  // its first packet keeps the speakers and the screen aligned
-  const firstAts = streams.map((stream) => stream.packets[0]!.at);
-  const minFirstAt = Math.min(...firstAts);
-  const offsets = firstAts.map((at) => (at - minFirstAt) / 1000);
+  await fs.writeFile(
+    sdpPath,
+    buildCombinedSdp(
+      replayed.map((stream, i) => ({
+        rtpParameters: stream.rtpParameters,
+        port: ports[i]!,
+      })),
+    ),
+  );
 
   const args = buildFfmpegArgs({
-    sdpPaths,
-    offsets,
-    audioInputs,
-    videoInput,
+    sdpPath,
+    audioCount,
+    hasVideo: videoStream !== null,
     container,
     seconds,
     outPath,
@@ -286,9 +318,11 @@ const encodeClip = async (options: TEncodeOptions): Promise<TEncodeResult> => {
     ffmpeg.on("close", (code) => resolve(code));
   });
 
+  const sockets = openReplaySockets(replayed.length, logger);
+
   try {
     await sleep(FFMPEG_STARTUP_MS);
-    await replayPackets(streams, ports);
+    await replayPackets(replayed, sockets, ports);
 
     // 'q' makes ffmpeg flush and finalize the file instead of waiting for
     // more packets that will never come
@@ -299,19 +333,34 @@ const encodeClip = async (options: TEncodeOptions): Promise<TEncodeResult> => {
       // ffmpeg already exited, the close handler has the code
     }
 
-    const code = await Promise.race([
-      exited,
-      sleep(FFMPEG_EXIT_TIMEOUT_MS).then(() => "timeout" as const),
-    ]);
+    // ffmpeg only checks for the 'q' between packets, and with the replay
+    // over it sits ~10s in a blocking read first. resending the last packet
+    // unblocks the read; the demuxer drops it as a duplicate sequence number
+    let done = false;
 
-    if (code === "timeout") {
+    exited.then(() => {
+      done = true;
+    });
+
+    const deadline = Date.now() + FFMPEG_EXIT_TIMEOUT_MS;
+
+    while (!done && Date.now() < deadline) {
+      for (let i = 0; i < replayed.length; i += 1) {
+        const last = replayed[i]!.packets[replayed[i]!.packets.length - 1]!;
+
+        sockets[i]!.send(last.data, ports[i]!, "127.0.0.1");
+      }
+
+      await sleep(250);
+    }
+
+    if (!done) {
       ffmpeg.kill("SIGKILL");
       throw new Error("ffmpeg did not finish writing the clip in time");
     }
   } finally {
-    for (const sdpPath of sdpPaths) {
-      fs.rm(sdpPath, { force: true }).catch(() => {});
-    }
+    closeSockets(sockets);
+    fs.rm(sdpPath, { force: true }).catch(() => {});
   }
 
   const stat = await fs.stat(outPath).catch(() => null);
@@ -326,7 +375,7 @@ const encodeClip = async (options: TEncodeOptions): Promise<TEncodeResult> => {
   return {
     filePath: outPath,
     fileName: path.basename(outPath),
-    hasVideo: videoInput !== null,
+    hasVideo: videoStream !== null,
   };
 };
 
