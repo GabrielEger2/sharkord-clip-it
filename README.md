@@ -1,32 +1,46 @@
 # Clip It — a Sharkord plugin
 
 Press a hotkey (or a button in the voice controls) to clip the last N seconds
-of a voice channel's audio and video, instant-replay style.
+of a voice channel's audio and screen share, instant-replay style. The clip is
+saved per user on the server and downloaded straight into the clipping user's
+downloads folder.
 
-> Status: scaffold. The contract, settings, UI slot and hotkey are wired; the
-> media pipeline is not implemented yet.
+## How it works
 
-## How it will work
-
-1. **Buffer** — the server half subscribes to the channel's producers with
-   `ctx.voice.consume()` and keeps a rolling ring buffer of the last
-   `clipSeconds` of RTP packets per stream. The `onRtp` callback only buffers;
-   all real work happens at clip time.
-2. **Encode** — on clip, the buffered packets are handed to ffmpeg (via an SDP
-   built from the consumer's `rtpParameters`) and written to `ctx.dataPath`.
-   [Sharkord/iptv](https://github.com/Sharkord/iptv) has a worked example of
-   downloading and driving ffmpeg from a plugin.
-3. **Serve** — an authenticated `ctx.http` route serves the stored clips, and
-   a push notifies the channel that a clip was created.
+1. **Buffer** — the server half subscribes to every `audio`, `screen` and
+   `screen_audio` producer in live voice channels with `ctx.voice.consume()`
+   and keeps a rolling ring buffer of the last `clipSeconds` of RTP packets
+   per stream. While a screen share is buffered, a keyframe is requested every
+   2 seconds so any point of the buffer is decodable. Camera video is not
+   buffered.
+2. **Encode** — on clip, each buffered stream gets an SDP file and a loopback
+   UDP port, and the packets are replayed (paced, 8x real time) into a single
+   ffmpeg run: every voice is mixed into one opus track (`amix`), and the
+   screen share, when someone is sharing, is stream-copied without a
+   transcode. VP8/VP9 clips land in `.webm`, H264 in `.mkv`. ffmpeg itself is
+   downloaded on first load into `dataPath/bin`, the same setup as
+   [Sharkord/iptv](https://github.com/Sharkord/iptv).
+3. **Serve** — files are stored under `dataPath/clips/<userId>/` and served by
+   an authenticated `/clips/*` route. The clip is pushed to everyone in the
+   channel; the clipping user's client fetches it through
+   `fetchPluginRoute` and hands it to the browser as a download. A user's
+   oldest clips are pruned past `maxStoredClips`.
 
 ## Layout
 
 ```
 manifest.json              the plugin's identity, and the SDK version it targets
 src/types.ts               the typed contract shared by both halves
-src/server/index.ts        runs in the Sharkord server process
+src/server/index.ts        settings, clip action, http route, wiring
+src/server/recorder.ts     rolling RTP ring buffers per producer
+src/server/sdp.ts          SDP files ffmpeg reads the replayed streams from
+src/server/encode.ts       port allocation, packet replay, the ffmpeg run
+src/server/clips.ts        clip metadata and per-user pruning
+src/server/paths.ts        where binaries, clips and work files live
+src/server/downloads.ts    ffmpeg download (from Sharkord/iptv)
+src/server/binaries.ts     ffmpeg bootstrap state
 src/client/index.ts        declares which components render where
-src/client/clip-controls.tsx   the voice-panel button + bindable hotkey
+src/client/clip-controls.tsx   the voice-panel button, hotkey, notify + download
 ```
 
 ## Developing
@@ -58,3 +72,11 @@ bun run publish
 
 This builds, creates the GitHub release, and opens a PR against the
 [Sharkord plugin registry](https://github.com/Sharkord/plugins).
+
+## Known limits
+
+- A copied screen share can show a moment of corruption at the very start of
+  a clip until its first buffered keyframe, at most 2 seconds in.
+- Camera (`video`) producers are not clipped, only screen shares.
+- Stream alignment uses packet arrival times, so cross-stream sync is within
+  network jitter rather than sample exact.
